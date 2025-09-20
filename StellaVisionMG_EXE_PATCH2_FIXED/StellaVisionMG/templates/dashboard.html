@@ -1,0 +1,109 @@
+{% extends "base.html" %}
+{% from "_filters.html" import filters_bar %}
+{% block filters %}{{ filters_bar() }}{% endblock %}
+{% block content %}
+<div class="mb-3 text-end">
+  <button type="button" class="btn btn-outline-secondary theme-toggle">Modo Escuro</button>
+</div>
+<div class="row g-3">
+  {% for card in kpi_cards %}
+  <div class="col-sm-6 col-md-4 col-lg-3">
+    <div class="card h-100 {% if card.empty %}card-empty{% endif %}">
+      <div class="card-body">
+        <div class="d-flex justify-content-between align-items-center">
+          <h6 class="card-title">{{ card.title }}</h6>
+          {% if card.badge %}<span class="badge {% if card.badge=='ok' %}badge-ok{% elif card.badge=='aten' %}badge-aten{% else %}badge-crit{% endif %}">{{ card.badge }}</span>{% endif %}
+        </div>
+        <div class="display-6">{{ card.value }}</div>
+        {% if card.hint %}<div class="small mt-2"><span class="tooltip-small" title="{{ card.hint }}">Sem dados ainda — como resolver?</span></div>{% endif %}
+      </div>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+
+<hr class="my-4">
+
+<div class="row g-3">
+  <div class="col-lg-6">
+    <div class="card">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <strong>Top 10</strong>
+        <div>
+          <a href="?{{ q_toggle_top('faturamento') }}" class="btn btn-sm btn-outline-primary {% if top_metric=='faturamento' %}active{% endif %}">Faturamento</a>
+          <a href="?{{ q_toggle_top('quantidade') }}" class="btn btn-sm btn-outline-primary {% if top_metric=='quantidade' %}active{% endif %}">Quantidade</a>
+        </div>
+      </div>
+      <div class="card-body"><canvas id="chartTop10"></canvas></div>
+    </div>
+  </div>
+  <div class="col-lg-6">
+    <div class="card">
+      <div class="card-header"><strong>Participação por categoria</strong></div>
+      <div class="card-body"><canvas id="chartPieCategoria"></canvas></div>
+    </div>
+  </div>
+
+  <div class="col-lg-6">
+    <div class="card">
+      <div class="card-header"><strong>Margem por categoria (30d)</strong></div>
+      <div class="card-body"><canvas id="chartMargemCategoria"></canvas></div>
+    </div>
+  </div>
+  <div class="col-lg-6">
+    <div class="card">
+      <div class="card-header"><strong>Vendas por dia</strong></div>
+      <div class="card-body"><canvas id="chartVendasDia"></canvas></div>
+    </div>
+  </div>
+
+  <div class="col-12">
+    <div class="card">
+      <div class="card-header"><strong>Cidades vendidas</strong></div>
+      <div class="card-body"><canvas id="chartCidades"></canvas></div>
+    </div>
+  </div>
+</div>
+
+<script>
+async function fetchJSON(url){ const r = await fetch(url); return await r.json(); }
+(async () => {
+  const charts = await fetchJSON("{{ url_for('api_graficos') }}{{ '?' + request.query_string.decode() if request.query_string else '' }}");
+  // Top10
+  const ctx1 = document.getElementById('chartTop10'); 
+  new Chart(ctx1, {
+    type: 'bar',
+    data: { labels: charts.top10.labels, datasets: [{ label: charts.top10.label, data: charts.top10.values }] },
+    options: { responsive:true, plugins:{ legend:{ display:false } } }
+  });
+  // Pie Categoria
+  const ctx2 = document.getElementById('chartPieCategoria'); 
+  new Chart(ctx2, {
+    type: 'pie',
+    data: { labels: charts.categoria.labels, datasets: [{ data: charts.categoria.values }] },
+    options: { responsive:true }
+  });
+  // Margem Categoria
+  const ctx3 = document.getElementById('chartMargemCategoria');
+  new Chart(ctx3, {
+    type: 'bar',
+    data: { labels: charts.margem_categoria.labels, datasets: [{ label: 'Margem %', data: charts.margem_categoria.values }] },
+    options: { responsive:true, plugins:{ legend:{ display:false } } }
+  });
+  // Vendas por dia
+  const ctx4 = document.getElementById('chartVendasDia');
+  new Chart(ctx4, {
+    type: 'line',
+    data: { labels: charts.vendas_dia.labels, datasets: [{ label: 'Faturamento Diário (R$)', data: charts.vendas_dia.values }] },
+    options: { responsive:true }
+  });
+  // Cidades
+  const ctx5 = document.getElementById('chartCidades');
+  new Chart(ctx5, {
+    type: 'bar',
+    data: { labels: charts.cidades.labels, datasets: [{ label: 'Faturamento (R$)', data: charts.cidades.values }] },
+    options: { indexAxis: 'y', responsive:true, plugins:{ legend:{ display:false } } }
+  });
+})();
+</script>
+{% endblock %}
