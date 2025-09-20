@@ -1,5 +1,9 @@
-import os, sqlite3, json, datetime, re, hashlib, sys, sys
+import os, sqlite3, json, datetime, re, hashlib, sys, unicodedata
 from flask import Flask, render_template, request, redirect, url_for, jsonify, send_file, flash, session, g
+try:
+    from flask_wtf import CSRFProtect  # type: ignore
+except Exception:  # pragma: no cover - flask_wtf é opcional
+    CSRFProtect = None
 import init_db, seed
 import webbrowser, threading, socket
 
@@ -11,7 +15,7 @@ def _base_dir():
     return os.path.dirname(__file__)
 APP_DIR = _base_dir()
 DB_PATH = os.path.join(APP_DIR, "erp.db")
-SECRET = os.environ.get("SECRET_KEY","dev")
+SECRET = os.environ.get("SECRET_KEY", "dev")
 
 # Directory with bundled (read-only) resources when frozen (templates/static)
 def _bundle_dir():
@@ -91,10 +95,46 @@ def ensure_migrations():
             _c.execute("INSERT INTO auth_users (username, password) VALUES (?, ?)",
                        ("MACHADO", hashlib.sha256("BH8EHEKGCC7QC".encode()).hexdigest()))
 
+        stock_sql = _c.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='stock_moves'"
+        ).fetchone()
+        if stock_sql:
+            sql_def = stock_sql["sql"] if isinstance(stock_sql, sqlite3.Row) else stock_sql[0]
+        else:
+            sql_def = None
+        if sql_def and ("ajuste_edit_prod" not in sql_def or "venda_edit" not in sql_def):
+            _c.execute("PRAGMA foreign_keys = OFF")
+            _c.execute("ALTER TABLE stock_moves RENAME TO stock_moves_old")
+            _c.execute(
+                """
+                CREATE TABLE stock_moves(
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  data TEXT,
+                  product_id INTEGER,
+                  tipo TEXT CHECK(tipo IN ('IN','OUT')),
+                  qtde INTEGER,
+                  origem TEXT CHECK(origem IN ('compra','venda','ajuste','rma_retorno','rma_troca','ajuste_edit_prod','venda_edit')),
+                  ref_id INTEGER,
+                  usuario_id INTEGER,
+                  FOREIGN KEY(product_id) REFERENCES products(id),
+                  FOREIGN KEY(usuario_id) REFERENCES users(id)
+                )
+                """
+            )
+            _c.execute(
+                """
+                INSERT INTO stock_moves(id, data, product_id, tipo, qtde, origem, ref_id, usuario_id)
+                SELECT id, data, product_id, tipo, qtde, origem, ref_id, usuario_id FROM stock_moves_old
+                """
+            )
+            _c.execute("DROP TABLE stock_moves_old")
+            _c.execute("PRAGMA foreign_keys = ON")
+            _c.execute("CREATE INDEX IF NOT EXISTS idx_moves_prod_data ON stock_moves(product_id, data)")
+
 
 # ---- Helpers to run server in EXE safely ----
-def _free_port(preferred=5000):
-    for p in [preferred, 5001, 5002, 5050, 8000, 8080]:
+def _free_port(preferred=5001):
+    for p in [preferred, 5002, 5050, 8000, 8080]:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             sock.settimeout(0.2)
             res = sock.connect_ex(("127.0.0.1", p))
@@ -107,36 +147,99 @@ def _open_browser(url):
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()
     except Exception:
         pass
-app = Flask(__name__, template_folder=os.path.join(BUNDLE_DIR,'templates'), static_folder=os.path.join(BUNDLE_DIR,'static'))
-(__name__)
+app = Flask(
+    __name__,
+    template_folder=os.path.join(BUNDLE_DIR, "templates"),
+    static_folder=os.path.join(BUNDLE_DIR, "static"),
+)
 app.secret_key = SECRET
+if CSRFProtect:
+    CSRFProtect(app)
 # Executa migrações ao iniciar o aplicativo
 ensure_migrations()
 
-# ``CURRENT_USER_ID`` is used in various stock move operations to tie actions
-# to a user.  It will be set from the logged in user via ``@app.before_request``.
-CURRENT_USER_ID = None
+
+def _slug(s: str) -> str:
+    if s is None:
+        return ""
+    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode()
+    s = re.sub(r"[^A-Za-z0-9]+", "-", s).strip("-")
+    return s.upper()
+
+
+def _build_prefix(platform, model, capacity, color, region, cond):
+    parts = [platform, model, capacity, color, region, cond]
+    parts = [_slug(p) for p in parts if p and str(p).strip()]
+    prefix = "-".join(parts)
+    return prefix[:80]
+
+
+def _next_seq(db, prefix):
+    base = prefix or "SKU"
+    row = db.execute(
+        "SELECT MAX(CAST(substr(sku, LENGTH(?) + 2) AS INTEGER)) AS maxseq "
+        "FROM products WHERE sku LIKE ?",
+        (base, base + '-%')
+    ).fetchone()
+    max_seq = 0
+    if row is not None:
+        try:
+            max_seq = row['maxseq'] or 0
+        except (KeyError, TypeError):
+            max_seq = row[0] if row[0] is not None else 0
+    return max_seq + 1
+
+
+def get_db():
+    if "_db_conn" not in g:
+        conn_obj = sqlite3.connect(DB_PATH)
+        conn_obj.row_factory = sqlite3.Row
+        g._db_conn = conn_obj
+    return g._db_conn
+
+
+@app.teardown_appcontext
+def close_db(exception=None):
+    db = g.pop("_db_conn", None)
+    if db is not None:
+        db.close()
 
 @app.before_request
 def require_login():
     """Redirect users to the login page unless they are already authenticated.
 
-    This hook runs before every request.  It checks if a ``user_id`` is stored
-    in the Flask session.  If not, and the current endpoint is not part of
-    the login/logout flow or serving static files, the user is redirected to
-    the login page.  When a user is authenticated the global
-    ``CURRENT_USER_ID`` is updated to reflect the logged in user id.
+    O identificador do usuário autenticado é armazenado em ``g.user_id`` para
+    ser utilizado nas rotas que gravam movimentações.
     """
-    # Endpoints that don't require login.  Static endpoints begin with "static".
-    exempt = {"login", "logout", "static"}
-    if request.endpoint and (request.endpoint in exempt or request.endpoint.startswith("static")):
+    exempt = {"login", "logout", "dev_sku", "_dev_routes"}
+    endpoint = request.endpoint or ""
+    g.user_id = session.get("user_id")
+    if endpoint in exempt or endpoint.startswith("static"):
         return
-    user_id = session.get("user_id")
-    if not user_id:
+    if g.user_id is None:
         return redirect(url_for("login"))
-    # Set global user id for use in stock adjustments and sales
-    global CURRENT_USER_ID
-    CURRENT_USER_ID = user_id
+
+
+def current_user_id():
+    return getattr(g, "user_id", None)
+
+
+@app.route("/dev/routes")
+def _dev_routes():
+    return "<pre>" + "\n".join(sorted(r.rule for r in app.url_map.iter_rules())) + "</pre>"
+
+
+@app.route("/dev/sku")
+def dev_sku():
+    db = get_db()
+    pr = request.args
+    prefix = _build_prefix(
+        pr.get("platform"), pr.get("model"), pr.get("capacity"),
+        pr.get("color"), pr.get("region"), pr.get("cond")
+    )
+    seq = _next_seq(db, prefix)
+    sku = f"{prefix}-{seq:05d}" if prefix else f"SKU-{seq:05d}"
+    return jsonify({"prefix": prefix, "seq": seq, "sku": sku})
 
 # ==========================================================================================
 #                                       Rotas de edição
@@ -263,7 +366,7 @@ def produto_edit(prod_id):
                         abs(diff),
                         "ajuste_edit_prod",
                         prod_id,
-                        CURRENT_USER_ID,
+                        current_user_id(),
                     ),
                 )
         flash("Produto atualizado", "success")
@@ -385,7 +488,7 @@ def venda_edit(sale_id):
                             qtde_mov,
                             "venda_edit",
                             sale_id,
-                            CURRENT_USER_ID,
+                            current_user_id(),
                         ),
                     )
                     # ajusta estoque em products
@@ -718,6 +821,38 @@ def dashboard():
     ini,fim,categoria,cidade,vendedor,incluir_rma = get_filters()
     top_metric = request.args.get("top","faturamento")
     kpis = compute_kpis(ini,fim,categoria,cidade,vendedor,incluir_rma)
+    with conn() as c:
+        top_rows = c.execute(
+            """
+            SELECT
+              COALESCE(NULLIF(MIN(TRIM(p.nome)), ''), '(SEM NOME)') AS nome,
+              SUM(COALESCE(si.preco_unit,0) - COALESCE(si.custo_snap,0)) AS lucro_liquido
+            FROM products p
+            LEFT JOIN sale_items si ON si.product_id = p.id
+            GROUP BY UPPER(TRIM(COALESCE(p.nome,'')))
+            ORDER BY lucro_liquido DESC
+            LIMIT 10
+            """
+        ).fetchall()
+        daily_rows = c.execute(
+            """
+            SELECT DATE(COALESCE(s.data, CURRENT_TIMESTAMP)) AS dia,
+                   SUM(COALESCE(si.preco_unit,0) - COALESCE(si.custo_snap,0)) AS lucro_liquido
+            FROM sale_items si
+            JOIN sales s ON s.id = si.sale_id
+            GROUP BY DATE(COALESCE(s.data, CURRENT_TIMESTAMP))
+            ORDER BY dia ASC
+            """
+        ).fetchall()
+    rows = [
+        {
+            "nome": r["nome"],
+            "lucro_liquido": r["lucro_liquido"] or 0,
+        }
+        for r in top_rows
+    ]
+    chart_labels = [r["dia"] for r in daily_rows]
+    chart_values = [float(r["lucro_liquido"] or 0) for r in daily_rows]
     # KPI cards
     kpi_cards = [
         {"title":"Faturamento", "value": br_money(kpis["faturamento"]), "badge":"ok" if kpis["faturamento"]>0 else None, "hint": None if kpis["faturamento"]>0 else "Registre vendas."},
@@ -731,7 +866,14 @@ def dashboard():
         {"title":"Lucro bruto", "value": br_money(kpis["lucro_bruto"]), "badge": None, "hint": None},
         {"title":"Lucro líquido (mês/período)", "value": br_money(kpis["lucro_liquido"]), "badge": None, "hint": None},
     ]
-    return render_template("dashboard.html", kpi_cards=kpi_cards, top_metric=top_metric)
+    return render_template(
+        "dashboard.html",
+        kpi_cards=kpi_cards,
+        top_metric=top_metric,
+        rows=rows,
+        chart_labels=chart_labels,
+        chart_values=chart_values,
+    )
 
 @app.route("/api/graficos")
 def api_graficos():
@@ -951,7 +1093,7 @@ def compras():
             c.execute("INSERT INTO purchase_items(purchase_id,product_id,qtde,custo_unit) VALUES(?,?,?,?)", (pid, pr_id, qtde, custo_unit))
             # mov IN + atualiza estoque e custo_base
             c.execute("INSERT INTO stock_moves(data,product_id,tipo,qtde,origem,ref_id,usuario_id) VALUES(?,?,?,?,?,?,?)",
-                      (data.isoformat(), pr_id, "IN", qtde, "compra", pid, CURRENT_USER_ID))
+                      (data.isoformat(), pr_id, "IN", qtde, "compra", pid, current_user_id()))
             c.execute("UPDATE products SET estoque_atual=COALESCE(estoque_atual,0)+?, custo_base=COALESCE(?, custo_base) WHERE id=?",
                       (qtde, custo_unit, pr_id))
             flash("Compra registrada", "success")
@@ -1132,7 +1274,7 @@ def rmas():
                 flash("Fora da janela de RMA.", "danger"); return redirect(url_for("rmas"))
 
             rma_id = c.execute("INSERT INTO rmas(codigo_rma,sale_id,tipo,motivo,forma_compensacao,valor_reembolso,status,usuario_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                               (codigo, sale_id, tipo, motivo, forma, valor_reembolso, "APROVADO", CURRENT_USER_ID, now.isoformat(), now.isoformat())).lastrowid
+                               (codigo, sale_id, tipo, motivo, forma, valor_reembolso, "APROVADO", current_user_id(), now.isoformat(), now.isoformat())).lastrowid
             pr = c.execute("SELECT id FROM products WHERE sku=?", (sku,)).fetchone()
             if not pr:
                 flash("Produto não encontrado", "danger"); return redirect(url_for("rmas"))
@@ -1140,7 +1282,7 @@ def rmas():
             # Movimentações
             # entrada do devolvido
             c.execute("INSERT INTO stock_moves(data,product_id,tipo,qtde,origem,ref_id,usuario_id) VALUES(?,?,?,?,?,?,?)",
-                      (now.isoformat(), pr["id"], "IN", qtde, "rma_retorno" if tipo=="RETORNO" else "rma_troca", rma_id, CURRENT_USER_ID))
+                      (now.isoformat(), pr["id"], "IN", qtde, "rma_retorno" if tipo=="RETORNO" else "rma_troca", rma_id, current_user_id()))
             c.execute("UPDATE products SET estoque_atual=estoque_atual+? WHERE id=?", (qtde, pr["id"]))
             # se TROCA, saída do novo é feita manualmente em outra venda/lançamento ou poderia ser estendida aqui.
             flash("RMA criado", "success")
@@ -1168,10 +1310,10 @@ def ajustes():
                 flash("Bloqueado: estoque não pode ficar negativo.", "danger"); return redirect(url_for("ajustes"))
             now = datetime.datetime.now().isoformat(timespec='seconds')
             aid = c.execute("INSERT INTO stock_adjustments(product_id,ajuste_tipo,qtde_delta,qtde_antes,qtde_depois,motivo,anexo_path,usuario_id,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                            (pr["id"], tipo, delta, antes, depois, motivo, None, CURRENT_USER_ID, now)).lastrowid
+                            (pr["id"], tipo, delta, antes, depois, motivo, None, current_user_id(), now)).lastrowid
             mov_tipo = "IN" if delta>0 else "OUT"
             c.execute("INSERT INTO stock_moves(data,product_id,tipo,qtde,origem,ref_id,usuario_id) VALUES(?,?,?,?,?,?,?)",
-                      (now, pr["id"], mov_tipo, abs(delta), "ajuste", aid, CURRENT_USER_ID))
+                      (now, pr["id"], mov_tipo, abs(delta), "ajuste", aid, current_user_id()))
             c.execute("UPDATE products SET estoque_atual=? WHERE id=?", (depois, pr["id"]))
             flash("Ajuste lançado.", "success")
     with conn() as c:
@@ -1285,7 +1427,7 @@ def venda_delete(sale_id):
             c.execute("UPDATE products SET estoque_atual = COALESCE(estoque_atual,0) + ? WHERE id=?", (it['qtde'], it['product_id']))
             c.execute(
                 "INSERT INTO stock_moves(data,product_id,tipo,qtde,origem,ref_id,usuario_id) VALUES(?,?,?,?,?,?,?)",
-                (datetime.date.today().isoformat(), it['product_id'], 'IN', it['qtde'], 'ajuste', sale_id, CURRENT_USER_ID)
+                (datetime.date.today().isoformat(), it['product_id'], 'IN', it['qtde'], 'ajuste', sale_id, current_user_id())
             )
         c.execute("DELETE FROM sale_items WHERE sale_id=?", (sale_id,))
         c.execute("DELETE FROM sales WHERE id=?", (sale_id,))
@@ -1294,10 +1436,17 @@ def venda_delete(sale_id):
 
 if __name__ == "__main__":
     check_files()
-    port = int(os.environ.get("PORT","5000"))
-    host = os.environ.get("HOST","127.0.0.1")
-    host = '127.0.0.1'
-port = _free_port(5000)
-url = f'http://{host}:{port}'
-_open_browser(url)
-app.run(host=host, port=port, debug=False, use_reloader=False)
+
+    import os
+
+    host = os.environ.get("HOST", "127.0.0.1")
+    port = int(os.environ.get("PORT", "5001"))
+
+    # Se eu quiser ativar a escolha automática de porta livre:
+    if os.environ.get("AUTO_FREE_PORT", "0") == "1":
+        port = _free_port(port)  # usa a porta escolhida como base (5001 por padrão)
+
+    url = f"http://{host}:{port}"
+    _open_browser(url)
+
+    app.run(host=host, port=port, debug=False, use_reloader=False)
