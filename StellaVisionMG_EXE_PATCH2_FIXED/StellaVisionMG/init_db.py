@@ -79,7 +79,7 @@ CREATE TABLE IF NOT EXISTS stock_moves(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   data TEXT, product_id INTEGER, tipo TEXT CHECK(tipo IN ('IN','OUT')),
   qtde INTEGER,
-  origem TEXT CHECK(origem IN ('compra','venda','ajuste','rma_retorno','rma_troca')),
+  origem TEXT CHECK(origem IN ('compra','venda','ajuste','rma_retorno','rma_troca','ajuste_edit_prod','venda_edit')),
   ref_id INTEGER, usuario_id INTEGER,
   FOREIGN KEY(product_id) REFERENCES products(id),
   FOREIGN KEY(usuario_id) REFERENCES users(id)
